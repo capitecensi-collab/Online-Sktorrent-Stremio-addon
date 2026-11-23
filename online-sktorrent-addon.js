@@ -20,7 +20,8 @@ const builder = addonBuilder({
 });
 
 const commonHeaders = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9,sk;q=0.8,cs;q=0.7',
     'Accept-Encoding': 'identity'
 };
 
@@ -65,40 +66,79 @@ function formatName(fullTitle, flagsArray) {
     return fullTitle + "\n⚙️SKTonline" + (iconStr ? "\n" + iconStr : "");
 }
 
-async function getTitleFromIMDb(imdbId) {
+async function getTitleFromCinemeta(imdbId, type = "movie") {
+    const metaType = type === "series" ? "series" : "movie";
+    const url = `https://v3-cinemeta.strem.io/meta/${metaType}/${imdbId}.json`;
+    console.log(`[DEBUG] 🎞️ Cinemeta fallback Request: ${url}`);
+    try {
+        const res = await axios.get(url, { timeout: 8000 });
+        const metaName = res.data && res.data.meta && res.data.meta.name ? decode(String(res.data.meta.name).trim()) : "";
+        if (metaName) {
+            console.log(`[DEBUG] ✅ Cinemeta title: ${metaName}`);
+            return { title: metaName, originalTitle: metaName };
+        }
+    } catch (err) {
+        console.error("[ERROR] Cinemeta fallback zlyhal:", err.message);
+    }
+    return null;
+}
+
+async function getTitleFromIMDb(imdbId, type = "movie") {
+    let title = "";
+    let originalTitle = "";
+
     try {
         const url = `https://www.imdb.com/title/${imdbId}/`;
         console.log(`[DEBUG] 🌐 IMDb Request: ${url}`);
-        const res = await axios.get(url, { headers: commonHeaders });
+        const res = await axios.get(url, { headers: commonHeaders, timeout: 8000 });
 
-        if (res.status === 404) {
-            console.error("[ERROR] IMDb scraping zlyhal: stránka neexistuje (404)");
-            return null;
+        if (res.status === 200 && res.data) {
+            const $ = cheerio.load(res.data);
+            const titleRaw = $('title').text().split(' - ')[0].trim();
+            const decodedTitle = decode(titleRaw);
+
+            // Odfiltrujeme chybové/blokované titulky stránky IMDb
+            if (decodedTitle && !/^IMDb/i.test(decodedTitle) && !/Error/i.test(decodedTitle)) {
+                title = decodedTitle;
+                originalTitle = decodedTitle;
+            }
+
+            const ldJson = $('script[type="application/ld+json"]').html();
+            if (ldJson) {
+                try {
+                    const json = JSON.parse(ldJson);
+                    if (json && json.name) {
+                        const decodedLd = decode(String(json.name).trim());
+                        if (decodedLd) {
+                            originalTitle = decodedLd;
+                            if (!title) title = decodedLd;
+                        }
+                    }
+                } catch (_) {
+                    // Ignorujeme neplatný JSON-LD
+                }
+            }
         }
-
-        const $ = cheerio.load(res.data);
-        const titleRaw = $('title').text().split(' - ')[0].trim();
-        const title = decode(titleRaw);
-        const ldJson = $('script[type="application/ld+json"]').html();
-        let originalTitle = title;
-        if (ldJson) {
-            const json = JSON.parse(ldJson);
-            if (json && json.name) originalTitle = decode(json.name.trim());
-        }
-
-        console.log(`[DEBUG] 🎬 IMDb title: ${title}, original: ${originalTitle}`);
-        return { title, originalTitle };
     } catch (err) {
         console.error("[ERROR] IMDb scraping zlyhal:", err.message);
-        return null;
     }
+
+    if (!title && !originalTitle) {
+        return await getTitleFromCinemeta(imdbId, type);
+    }
+
+    if (!title) title = originalTitle;
+    if (!originalTitle) originalTitle = title;
+
+    console.log(`[DEBUG] 🎬 IMDb title: ${title}, original: ${originalTitle}`);
+    return { title, originalTitle };
 }
 
 async function searchOnlineVideos(query) {
     const searchUrl = `https://online.sktorrent.eu/search/videos?search_query=${encodeURIComponent(query)}`;
     console.log(`[INFO] 🔍 Hľadám '${query}' na ${searchUrl}`);
     try {
-        const res = await axios.get(searchUrl, { headers: commonHeaders });
+        const res = await axios.get(searchUrl, { headers: commonHeaders, timeout: 10000 });
         console.log(`[DEBUG] Status: ${res.status}`);
         console.log(`[DEBUG] HTML Snippet:`, res.data.slice(0, 300));
 
@@ -124,7 +164,7 @@ async function extractStreamsFromVideoId(videoId) {
     const url = `https://online.sktorrent.eu/video/${videoId}`;
     console.log(`[DEBUG] 🔎 Načítavam detaily videa: ${url}`);
     try {
-        const res = await axios.get(url, { headers: commonHeaders });
+        const res = await axios.get(url, { headers: commonHeaders, timeout: 10000 });
         console.log(`[DEBUG] Status: ${res.status}`);
         console.log(`[DEBUG] Detail HTML Snippet:`, res.data.slice(0, 300));
 
@@ -162,13 +202,13 @@ builder.defineStreamHandler(async ({ type, id }) => {
     const season = seasonStr ? parseInt(seasonStr) : null;
     const episode = episodeStr ? parseInt(episodeStr) : null;
 
-    const titles = await getTitleFromIMDb(imdbId);
+    const titles = await getTitleFromIMDb(imdbId, type);
     if (!titles) return { streams: [] };
 
     const { title, originalTitle } = titles;
     const queries = new Set();
 
-    const baseTitles = [title, originalTitle].map(t => t.replace(/\(.*?\)/g, '').trim());
+    const baseTitles = [title, originalTitle].map(t => t.replace(/\(.*?\)/g, '').trim()).filter(Boolean);
     for (const base of baseTitles) {
         const noDia = removeDiacritics(base);
         const short = shortenTitle(noDia);
